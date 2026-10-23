@@ -52,6 +52,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
   String? _streamHost; // host del m3u8/mp4 que está abriendo ExoPlayer
   Timer? _clock;
   bool _failed = false;
+  bool _textureOnly = false; // la SurfaceView ya falló en esta box: ir directo a textura
 
   Episode? get _next {
     final list = widget.playlist;
@@ -158,13 +159,29 @@ class _PlayerScreenState extends State<PlayerScreen> {
       _streamHost = Uri.parse(src.url).host;
       stage = 'abrir el stream de $_streamHost';
       _setStage('${server.name}: abriendo stream ${src.isHls ? 'HLS' : 'MP4'} de $_streamHost…');
-      c = VideoPlayerController.networkUrl(
-        Uri.parse(src.url),
-        httpHeaders: src.headers,
-        formatHint: src.isHls ? VideoFormat.hls : null, // la URL de Zilla no termina en .m3u8
-      );
-      await c.initialize().timeout(const Duration(seconds: 30),
-          onTimeout: () => throw AppError('$_streamHost no envió el video en 30 s'));
+      // Muchas TV boxes no aceptan la superficie de textura de Flutter como salida del decodificador
+      // HW ("MediaCodecVideoRenderer error" incluso con H.264). SurfaceView (platformView) es lo que
+      // esperan; la textura queda de respaldo.
+      final viewTypes = [if (!_textureOnly) VideoViewType.platformView, VideoViewType.textureView];
+      for (final viewType in viewTypes) {
+        c = VideoPlayerController.networkUrl(
+          Uri.parse(src.url),
+          httpHeaders: src.headers,
+          formatHint: src.isHls ? VideoFormat.hls : null, // la URL de Zilla no termina en .m3u8
+          viewType: viewType,
+        );
+        try {
+          await c.initialize().timeout(const Duration(seconds: 30),
+              onTimeout: () => throw AppError('$_streamHost no envió el video en 30 s'));
+          break;
+        } catch (e) {
+          if (!_isDecoderError(e) || viewType == VideoViewType.textureView || stale()) rethrow;
+          debugPrint('… ${server.name}: el decodificador falló con $viewType, probando con textura');
+          _textureOnly = true;
+          await c.dispose();
+        }
+      }
+      c!; // el bucle sale con un controlador inicializado o relanza el error
       if (stale()) {
         c.dispose();
         return true;
@@ -191,18 +208,32 @@ class _PlayerScreenState extends State<PlayerScreen> {
     // ExoPlayer: "Source error" = HTTP/red (403, 404, TLS); "Decoder"/"MediaCodec" = la box
     // no puede decodificar el formato (p. ej. HEVC o 1080p de perfil alto).
     var s = e is PlatformException ? '${e.message ?? e.code}${e.details != null ? ' ${e.details}' : ''}' : '$e';
-    if (RegExp('decoder|mediacodec', caseSensitive: false).hasMatch(s)) {
-      s = 'la TV box no puede decodificar este video ($s)';
+    if (_isDecoderError(s)) {
+      s = 'falló el decodificador de video de la TV box ($s)';
     } else if (s.contains('Source error') || s.contains('InvalidResponseCode')) {
       s = 'el servidor rechazó o cortó la descarga ($s)';
     }
-    return s.length > 160 ? '${s.substring(0, 160)}…' : s;
+    return s.length > 300 ? '${s.substring(0, 300)}…' : s;
+  }
+
+  bool _isDecoderError(Object e) {
+    final s = e is PlatformException ? '${e.message} ${e.details}' : '$e';
+    return RegExp('decoder|mediacodec', caseSensitive: false).hasMatch(s);
   }
 
   void _onTick() {
     final c = _controller;
     if (c == null) return;
     final v = c.value;
+    // Con SurfaceView el decodificador se configura al mostrarse el video, después de initialize():
+    // si falla ahí, se reintenta el mismo servidor con textura.
+    if (v.hasError && !_textureOnly && c.viewType == VideoViewType.platformView && _isDecoderError(v.errorDescription ?? '')) {
+      debugPrint('… ${_current?.name}: el decodificador falló con SurfaceView, reintentando con textura');
+      _textureOnly = true;
+      c.removeListener(_onTick);
+      _playServer(_current!);
+      return;
+    }
     if (v.hasError) {
       _status = 'Error de reproducción en ${_current?.name} (${_streamHost ?? '?'}): '
           '${_describe(v.errorDescription ?? 'desconocido')}\nPulsa ↑ para elegir otro.';

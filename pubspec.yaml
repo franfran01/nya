@@ -1,7 +1,7 @@
 name: animeflvtv
 description: Cliente Android / Android TV para explorar y reproducir anime.
 publish_to: 'none'
-version: 1.0.1+2
+version: 1.0.2+3
 
 environment:
   sdk: ^3.5.0
