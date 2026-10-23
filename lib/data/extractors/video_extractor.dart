@@ -25,24 +25,39 @@ class VideoExtractor {
     return [...servers]..sort((a, b) => rank(a).compareTo(rank(b)));
   }
 
+  /// Prueba cada método y, si ninguno sirve, lanza un [AppError] con lo que falló en cada paso.
   Future<StreamSource> extract(VideoServer server) async {
     final url = server.embedUrl;
     final host = Uri.parse(url).host;
+    final steps = <String>[];
 
     if (host.contains('mp4upload')) {
-      final src = await _mp4upload(url);
-      if (src != null) return src;
+      try {
+        final src = await _mp4upload(url);
+        if (src != null) return src;
+        steps.add('MP4Upload: no hay enlace .mp4 en la página');
+      } catch (e) {
+        steps.add('MP4Upload: $e');
+      }
     }
 
     // Desu/Magi (jkanime.net/jkplayer/um|umv) caen aquí: la playlist exige Referer jkanime.net.
-    final generic = await _generic(url);
-    if (generic != null) return generic;
+    try {
+      final generic = await _generic(url);
+      if (generic != null) return generic;
+      steps.add('HTML: sin enlace m3u8/mp4');
+    } catch (e) {
+      steps.add('HTML: $e');
+    }
 
     // Voe, Filemoon, Streamwish... generan el enlace con JS ofuscado → WebView.
-    final sniffed = await _sniffer.sniff(url);
-    if (sniffed != null) return sniffed;
+    try {
+      return await _sniffer.sniff(url);
+    } catch (e) {
+      steps.add('WebView: $e');
+    }
 
-    throw Exception('No se pudo extraer el video de ${server.name}');
+    throw AppError('$host → ${steps.join(' · ')}');
   }
 
   Future<StreamSource?> _mp4upload(String url) async {
@@ -58,21 +73,17 @@ class VideoExtractor {
   }
 
   Future<StreamSource?> _generic(String url) async {
-    try {
-      var page = await fetchHtml(url, referer: '$kBaseUrl/');
-      for (final packed in JsUnpacker.findAll(page)) {
-        page += '\n${JsUnpacker.unpack(packed)}';
-      }
-      final m = RegExp(r'''https?://[^\s"'<>\\]+?\.(m3u8|mp4)(\?[^\s"'<>\\]*)?''').firstMatch(page);
-      if (m == null) return null;
-      final origin = Uri.parse(url).origin;
-      return StreamSource(
-        url: m.group(0)!,
-        isHls: m.group(1) == 'm3u8',
-        headers: {'Referer': '$origin/', 'Origin': origin, 'User-Agent': kUserAgent},
-      );
-    } catch (_) {
-      return null;
+    var page = await fetchHtml(url, referer: '$kBaseUrl/');
+    for (final packed in JsUnpacker.findAll(page)) {
+      page += '\n${JsUnpacker.unpack(packed)}';
     }
+    final m = RegExp(r'''https?://[^\s"'<>\\]+?\.(m3u8|mp4)(\?[^\s"'<>\\]*)?''').firstMatch(page);
+    if (m == null) return null;
+    final origin = Uri.parse(url).origin;
+    return StreamSource(
+      url: m.group(0)!,
+      isHls: m.group(1) == 'm3u8',
+      headers: {'Referer': '$origin/', 'Origin': origin, 'User-Agent': kUserAgent},
+    );
   }
 }

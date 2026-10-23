@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import 'package:video_player/video_player.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
+import '../../core/http.dart';
 import '../../core/services.dart';
 import '../../data/models.dart';
 import '../theme.dart';
@@ -44,6 +45,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
   bool _overlay = true;
   Timer? _hideTimer;
   bool _advanced = false;
+  int _attempt = 0; // cada intento invalida los anteriores (elegir otro servidor, salir)
+  final _errors = <String>[]; // por qué falló cada servidor, visible en la TV
+  DateTime _stageStart = DateTime.now(); // para mostrar cuánto lleva la etapa actual
+  DateTime? _bufferingSince; // vigilante: stream que se queda cargando sin avanzar
+  String? _streamHost; // host del m3u8/mp4 que está abriendo ExoPlayer
+  Timer? _clock;
+  bool _failed = false;
 
   Episode? get _next {
     final list = widget.playlist;
@@ -59,44 +67,105 @@ class _PlayerScreenState extends State<PlayerScreen> {
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
     SystemChrome.setPreferredOrientations(
         [DeviceOrientation.landscapeLeft, DeviceOrientation.landscapeRight]);
+    _clock = Timer.periodic(const Duration(seconds: 1), (_) => _tick());
     _start();
   }
 
+  /// Cada segundo: refresca el contador de la etapa y vigila el buffering.
+  void _tick() {
+    if (!mounted) return;
+    final v = _controller?.value;
+    if (v != null && v.isInitialized && v.isBuffering && !v.hasError) {
+      _bufferingSince ??= DateTime.now();
+    } else {
+      _bufferingSince = null;
+    }
+    setState(() {});
+  }
+
+  /// Aviso del vigilante: el video abrió pero lleva rato sin recibir datos.
+  String? get _stallMessage {
+    final since = _bufferingSince;
+    if (since == null) return null;
+    final secs = DateTime.now().difference(since).inSeconds;
+    if (secs < 15) return null;
+    return 'Lleva $secs s cargando sin avanzar: ${_streamHost ?? 'el servidor'} no envía datos '
+        '(lento, bloqueado o el enlace caducó). Pulsa ↑ para elegir otro servidor.';
+  }
+
+  void _setStage(String s) {
+    debugPrint('… $s');
+    _stageStart = DateTime.now();
+    _setStatus(s);
+  }
+
   Future<void> _start() async {
+    _setStage('Cargando la página del episodio…');
     try {
       _servers = videoExtractor.sortByPreference(await scraper.servers(widget.episodeUrl));
     } catch (e) {
-      return _setStatus('Error al cargar el episodio: $e');
+      return _fail('No se pudo cargar la página del episodio: ${_describe(e)}');
     }
-    if (_servers.isEmpty) return _setStatus('Este episodio no tiene servidores');
+    if (_servers.isEmpty) {
+      return _fail('No se encontraron servidores en la página del episodio '
+          '(puede que jkanime haya cambiado su HTML)');
+    }
 
     // Prueba cada servidor hasta que uno reproduzca.
     for (final s in _servers) {
       if (!mounted) return;
       if (await _playServer(s)) return;
     }
-    _setStatus('Ningún servidor funcionó. Pulsa ↑ para elegir otro.');
+    _fail('Ningún servidor funcionó. Pulsa ↑ para elegir otro.');
   }
 
+  /// Estado final de error: se para el contador para que no parezca que sigue cargando.
+  void _fail(String message) {
+    debugPrint('✖ $message');
+    _clock?.cancel();
+    if (!mounted) return;
+    setState(() {
+      _status = message;
+      _failed = true;
+    });
+  }
+
+  /// Devuelve false si el servidor falló; true si reproduce o si otro intento lo reemplazó.
   Future<bool> _playServer(VideoServer server) async {
-    _setStatus('Conectando con ${server.name}…');
+    final attempt = ++_attempt;
+    bool stale() => !mounted || attempt != _attempt;
+
     final old = _controller;
+    if (!mounted) return true;
     setState(() {
       _controller = null;
       _current = server;
+      _streamHost = null;
+      _failed = false;
     });
+    if (!(_clock?.isActive ?? false)) _clock = Timer.periodic(const Duration(seconds: 1), (_) => _tick());
     await old?.dispose();
 
+    VideoPlayerController? c;
+    var stage = 'buscar el enlace'; // en qué paso falló, para el mensaje de error
     try {
-      final src = await videoExtractor.extract(server);
+      _setStage('${server.name}: buscando el enlace del video…');
+      // Tope global: sin él, un host lento (HTTP + WebView + ExoPlayer) deja la pantalla cargando minutos.
+      final src = await videoExtractor.extract(server).timeout(const Duration(seconds: 60),
+          onTimeout: () => throw const AppError('no se obtuvo el enlace en 60 s'));
+      if (stale()) return true;
       debugPrint('▶ ${server.name}: $src');
-      final c = VideoPlayerController.networkUrl(
+      _streamHost = Uri.parse(src.url).host;
+      stage = 'abrir el stream de $_streamHost';
+      _setStage('${server.name}: abriendo stream ${src.isHls ? 'HLS' : 'MP4'} de $_streamHost…');
+      c = VideoPlayerController.networkUrl(
         Uri.parse(src.url),
         httpHeaders: src.headers,
         formatHint: src.isHls ? VideoFormat.hls : null, // la URL de Zilla no termina en .m3u8
       );
-      await c.initialize().timeout(const Duration(seconds: 30));
-      if (!mounted) {
+      await c.initialize().timeout(const Duration(seconds: 30),
+          onTimeout: () => throw AppError('$_streamHost no envió el video en 30 s'));
+      if (stale()) {
         c.dispose();
         return true;
       }
@@ -106,13 +175,38 @@ class _PlayerScreenState extends State<PlayerScreen> {
       _showOverlay();
       return true;
     } catch (e) {
+      // Liberar siempre: las TV boxes tienen 1-2 decodificadores HW y un ExoPlayer colgado
+      // hace que todos los servidores siguientes fallen al instante.
+      await c?.dispose();
       debugPrint('✖ ${server.name}: $e');
+      if (stale()) return true;
+      _errors.add('${server.name} (al $stage): ${_describe(e)}');
+      if (mounted) setState(() {});
       return false;
     }
   }
 
+  String _describe(Object e) {
+    if (e is TimeoutException) return 'tiempo de espera agotado';
+    // ExoPlayer: "Source error" = HTTP/red (403, 404, TLS); "Decoder"/"MediaCodec" = la box
+    // no puede decodificar el formato (p. ej. HEVC o 1080p de perfil alto).
+    var s = e is PlatformException ? '${e.message ?? e.code}${e.details != null ? ' ${e.details}' : ''}' : '$e';
+    if (RegExp('decoder|mediacodec', caseSensitive: false).hasMatch(s)) {
+      s = 'la TV box no puede decodificar este video ($s)';
+    } else if (s.contains('Source error') || s.contains('InvalidResponseCode')) {
+      s = 'el servidor rechazó o cortó la descarga ($s)';
+    }
+    return s.length > 160 ? '${s.substring(0, 160)}…' : s;
+  }
+
   void _onTick() {
-    final v = _controller!.value;
+    final c = _controller;
+    if (c == null) return;
+    final v = c.value;
+    if (v.hasError) {
+      _status = 'Error de reproducción en ${_current?.name} (${_streamHost ?? '?'}): '
+          '${_describe(v.errorDescription ?? 'desconocido')}\nPulsa ↑ para elegir otro.';
+    }
     if (!_advanced && v.isInitialized && v.duration > Duration.zero && v.position >= v.duration) {
       _advanced = true;
       _goNext();
@@ -179,7 +273,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
       ),
     );
     if (picked != null && !await _playServer(picked)) {
-      _setStatus('${picked.name} no funcionó. Pulsa ↑ para elegir otro.');
+      _fail('${picked.name} no funcionó. Pulsa ↑ para elegir otro.');
     }
   }
 
@@ -217,6 +311,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   @override
   void dispose() {
+    _attempt++; // corta el bucle de servidores en curso
+    _clock?.cancel();
     _hideTimer?.cancel();
     _controller?.dispose();
     WakelockPlus.disable();
@@ -228,7 +324,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
   @override
   Widget build(BuildContext context) {
     final c = _controller;
-    final ready = c != null && c.value.isInitialized;
+    final ready = c != null && c.value.isInitialized && !c.value.hasError;
     return Scaffold(
       backgroundColor: Colors.black,
       body: Focus(
@@ -244,14 +340,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
             Center(
               child: ready
                   ? AspectRatio(aspectRatio: c.value.aspectRatio, child: VideoPlayer(c))
-                  : Column(mainAxisSize: MainAxisSize.min, children: [
-                      const CircularProgressIndicator(color: kAccent),
-                      const SizedBox(height: 16),
-                      Text(_status, style: const TextStyle(color: kTextDim)),
-                    ]),
+                  : _loading(),
             ),
             if (ready && c.value.isBuffering)
               const Center(child: CircularProgressIndicator(color: kAccent)),
+            if (ready && _stallMessage != null) _banner(_stallMessage!),
             AnimatedOpacity(
               opacity: _overlay || !ready ? 1 : 0,
               duration: const Duration(milliseconds: 250),
@@ -266,6 +359,38 @@ class _PlayerScreenState extends State<PlayerScreen> {
       ),
     );
   }
+
+  /// Pantalla de carga: etapa actual con su contador y lo que falló en los servidores anteriores.
+  Widget _loading() {
+    final secs = DateTime.now().difference(_stageStart).inSeconds;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 48),
+      child: Column(mainAxisSize: MainAxisSize.min, children: [
+        if (_failed)
+          const Icon(Icons.error_outline, color: Colors.redAccent, size: 48)
+        else
+          const CircularProgressIndicator(color: kAccent),
+        const SizedBox(height: 16),
+        Text(_failed ? _status : '$_status ($secs s)',
+            textAlign: TextAlign.center, style: const TextStyle(color: kTextDim)),
+        if (_errors.isNotEmpty) ...[
+          const SizedBox(height: 16),
+          for (final e in _errors)
+            Text('✖ $e', textAlign: TextAlign.center, style: const TextStyle(color: Colors.redAccent, fontSize: 12)),
+        ],
+      ]),
+    );
+  }
+
+  Widget _banner(String text) => Align(
+        alignment: Alignment.topCenter,
+        child: Container(
+          margin: const EdgeInsets.only(top: 80, left: 48, right: 48),
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(color: Colors.black87, borderRadius: BorderRadius.circular(8)),
+          child: Text(text, textAlign: TextAlign.center, style: const TextStyle(color: Colors.amberAccent)),
+        ),
+      );
 
   Widget _controls(VideoPlayerController? c) {
     final v = c?.value;
